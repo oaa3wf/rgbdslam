@@ -25,6 +25,7 @@
 #include <sensor_msgs/Image.h>
 #include <sensor_msgs/CameraInfo.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <geometry_msgs/TransformStamped.h>
 #include <nav_msgs/Odometry.h>
 #include <opencv2/core/core.hpp>
 #include <opencv2/features2d/features2d.hpp>
@@ -53,6 +54,12 @@ typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::Image,
 typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::Image, 
                                                         sensor_msgs::Image,
                                                         sensor_msgs::CameraInfo> NoCloudSyncPolicy;
+
+//The policy merges kinect messages with approximately equal timestamp into one callback(Dapo created for depth) 
+typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::Image, 
+                                                        sensor_msgs::Image,
+                                                        sensor_msgs::CameraInfo,
+																												geometry_msgs::TransformStamped> NoCloudImuSyncPolicy;
 
 
 /**
@@ -127,6 +134,12 @@ class OpenNIListener : public QObject {
     void noCloudCallback (const sensor_msgs::ImageConstPtr& visual_img_msg,
                           const sensor_msgs::ImageConstPtr& depth_img_msg,
                           const sensor_msgs::CameraInfoConstPtr& cam_info_msg) ;
+    //! For this callback the point cloud is not required.(Dapo created for imu) 
+    void noCloudCallback (const sensor_msgs::ImageConstPtr& visual_img_msg,
+                          const sensor_msgs::ImageConstPtr& depth_img_msg,
+                          const sensor_msgs::CameraInfoConstPtr& cam_info_msg,
+													const geometry_msgs::TransformStampedConstPtr& approx_transform) ;
+		
     //! No depth image but pointcloud, e.g., for stereo cameras
     void stereoCallback(const sensor_msgs::ImageConstPtr& visual_img_msg, const sensor_msgs::PointCloud2ConstPtr& point_cloud);
     //! Callback for the robot odometry
@@ -185,6 +198,13 @@ class OpenNIListener : public QObject {
                                cv::Mat depth_mono8_img,
                                std_msgs::Header depth_header,
                                const sensor_msgs::CameraInfoConstPtr& cam_info);
+    //! as cameraCallback, but create Node without cloud (Dapo created for imu)
+    void noCloudCameraCallback(cv::Mat visual_img, 
+                               cv::Mat depth, 
+                               cv::Mat depth_mono8_img,
+                               std_msgs::Header depth_header,
+                               const sensor_msgs::CameraInfoConstPtr& cam_info,
+															 const geometry_msgs::TransformStampedConstPtr& approx_transform);
     //!Load files in Background to not deadlock
     void loadPCDFilesAsync(QStringList);
     ///The GraphManager uses the Node objects to do the actual SLAM
@@ -198,10 +218,12 @@ class OpenNIListener : public QObject {
     message_filters::Synchronizer<StereoSyncPolicy>* stereo_sync_;
     message_filters::Synchronizer<KinectSyncPolicy>* kinect_sync_;
     message_filters::Synchronizer<NoCloudSyncPolicy>* no_cloud_sync_;
+		message_filters::Synchronizer<NoCloudImuSyncPolicy>* no_cloud_imu_sync_;
     message_filters::Subscriber<sensor_msgs::Image> *visua_sub_;      
     message_filters::Subscriber<sensor_msgs::Image> *depth_sub_;      
     message_filters::Subscriber<sensor_msgs::CameraInfo> *cinfo_sub_;      
     message_filters::Subscriber<sensor_msgs::PointCloud2> *cloud_sub_;
+		message_filters::Subscriber<geometry_msgs::TransformStamped> *imu_sub_;
     message_filters::Subscriber<nav_msgs::Odometry> *odom_sub_;
 
     BagSubscriber<sensor_msgs::Image>* rgb_img_sub_;

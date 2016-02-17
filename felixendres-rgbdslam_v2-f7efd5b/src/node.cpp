@@ -246,6 +246,160 @@ Node::Node(const cv::Mat& visual,
 
 
 
+//!Dapo added this
+//!Construct node without precomputed point cloud but with imu info. Computes the point cloud on
+//!demand, possibly subsampled
+Node::Node(const cv::Mat& visual, 
+           const cv::Mat& depth,
+           const cv::Mat& detection_mask,
+           const sensor_msgs::CameraInfoConstPtr& cam_info,
+					 const geometry_msgs::TransformStampedConstPtr& approx_transform, 
+           myHeader depth_header,
+           cv::Ptr<cv::FeatureDetector> detector,
+           cv::Ptr<cv::DescriptorExtractor> extractor) :
+  id_(-1), seq_id_(-1), vertex_id_(-1), valid_tf_estimate_(true),
+  timestamp_(depth_header.stamp),
+  has_odometry_edge_(false),
+  odometry_set_(false),
+  matchable_(true),
+  pc_col(new pointcloud_type()),
+  flannIndex(NULL),
+  header_(depth_header),
+  base2points_(tf::Transform::getIdentity(), depth_header.stamp, ParameterServer::instance()->get<std::string>("base_frame_name"), depth_header.frame_id),
+  ground_truth_transform_(tf::Transform::getIdentity(), depth_header.stamp, ParameterServer::instance()->get<std::string>("ground_truth_frame_name"), ParameterServer::instance()->get<std::string>("base_frame_name")),
+  odom_transform_(tf::Transform::getIdentity(), depth_header.stamp, "missing_odometry", depth_header.frame_id),
+  initial_node_matches_(0),
+  cam_info_(*cam_info),
+	approx_transform_(*approx_transform)
+{
+  ScopedTimer s("Node Constructor");
+  ParameterServer* ps = ParameterServer::instance();
+
+  //Create point cloud inf necessary
+  if(ps->get<bool>("store_pointclouds") || 
+     ps->get<int>("emm__skip_step") > 0 ||
+     ps->get<bool>("use_icp") ||
+     (ps->get<bool>("use_glwidget") && ps->get<bool>("use_gui") && ! ps->get<bool>("glwidget_without_clouds")))
+  {
+    pc_col = pointcloud_type::Ptr(createXYZRGBPointCloud(depth, visual, cam_info));
+  }
+  else //Else use empty one
+  {
+    pc_col = pointcloud_type::Ptr(new pointcloud_type());
+  }
+  pc_col->header = header_;
+
+  cv::Mat gray_img; 
+  if(visual.type() == CV_8UC3){
+    cvtColor(visual, gray_img, CV_RGB2GRAY);
+  } else {
+    gray_img = visual;
+  }
+
+
+#ifdef USE_SIFT_GPU
+  std::vector<float> descriptors;
+  if(ps->get<std::string>("feature_detector_type") == "SIFTGPU"){
+    ScopedTimer s("Feature Detection and Descriptor Extraction");
+    SiftGPUWrapper* siftgpu = SiftGPUWrapper::getInstance();
+    siftgpu->detect(gray_img, feature_locations_2d_, descriptors);
+    ROS_WARN_COND(descriptors.size()==0, "No keypoints for current image!");
+  } else 
+#endif
+  {
+    ScopedTimer s("Feature Detection");
+    ROS_FATAL_COND(detector.empty(), "No valid detector!");
+    detector->detect( gray_img, feature_locations_2d_, detection_mask);// fill 2d locations
+  }
+
+  // project pixels to 3dPositions and create search structures for the gicp
+#ifdef USE_SIFT_GPU
+  if(ps->get<std::string>("feature_extractor_type") == "SIFTGPU"){
+
+    if(ps->get<std::string>("feature_detector_type") != "SIFTGPU"){
+      //not already extracted descriptors in detection step
+      //clean keypoints from those without 3d FIXME: can be made more performant
+      projectTo3D(feature_locations_2d_, feature_locations_3d_, depth, cam_info);
+      SiftGPUWrapper* siftgpu = SiftGPUWrapper::getInstance();
+      siftgpu->detect(gray_img, feature_locations_2d_, descriptors);
+    } 
+    if(descriptors.size() > 0){
+      projectTo3DSiftGPU(feature_locations_2d_, feature_locations_3d_, depth, cam_info, descriptors, feature_descriptors_); 
+      ROS_INFO("Siftgpu Feature Descriptors size: %d x %d", feature_descriptors_.rows, feature_descriptors_.cols);
+    } else {
+      ROS_WARN("No descriptors for current image!");
+    }
+    //std::cout << "feature descriptors = "<< std::endl << std::setprecision(3)  << feature_descriptors_<< std::endl;
+  }
+  else
+#endif
+  {
+    //PREFILTER 
+    removeDepthless(feature_locations_2d_, depth);
+    size_t max_keyp = ps->get<int>("max_keypoints");
+    if(feature_locations_2d_.size() > max_keyp){
+      cv::KeyPointsFilter::retainBest(feature_locations_2d_, max_keyp);  
+      feature_locations_2d_.resize(max_keyp);//Because retainBest doesn't retain exactly max_keyp?
+    }
+
+    /*for(unsigned int i = 0; i < feature_locations_2d_.size(); i++){
+      feature_locations_2d_[i].class_id = i;
+      feature_locations_2d_[i].pt.x = round(feature_locations_2d_[i].pt.x);
+      feature_locations_2d_[i].pt.y = round(feature_locations_2d_[i].pt.y);
+      ROS_WARN("%u. Keypoint %.3i: (%f %f)", i, feature_locations_2d_[i].class_id, feature_locations_2d_[i].pt.x, feature_locations_2d_[i].pt.y);
+    }*/
+
+
+    ScopedTimer s("Feature Extraction");
+    extractor->compute(gray_img, feature_locations_2d_, feature_descriptors_); //fill feature_descriptors_ with information 
+    /*for(unsigned int i = 0; i < feature_locations_2d_.size(); i++){
+      ROS_WARN("%.3u. EKeypoint1 %.3i: (%f %f)", i, feature_locations_2d_[i].class_id, feature_locations_2d_[i].pt.x, feature_locations_2d_[i].pt.y);
+    }*/
+    removeDepthless(feature_locations_2d_, depth);//FIXME: Unnecessary?
+    /* for(unsigned int i = 0; i < feature_locations_2d_.size(); i++){
+      ROS_WARN("%.3u. EKeypoint %.3i: (%f %f)", i, feature_locations_2d_[i].class_id, feature_locations_2d_[i].pt.x, feature_locations_2d_[i].pt.y);
+    }  */
+    projectTo3D(feature_locations_2d_, feature_locations_3d_, depth, cam_info);
+    /* for(unsigned int i = 0; i < feature_locations_2d_.size(); i++){
+      ROS_WARN("%.3u. EKeypoint3 %.3i: (%f %f)", i, feature_locations_2d_[i].class_id, feature_locations_2d_[i].pt.x, feature_locations_2d_[i].pt.y);
+    }*/
+    ROS_INFO("Keypoints: %zu", feature_locations_2d_.size());
+    ROS_DEBUG("Feature Descriptors size: %d x %d", feature_descriptors_.rows, feature_descriptors_.cols);
+  }
+  assert(feature_locations_2d_.size() == feature_locations_3d_.size());
+  assert(feature_locations_3d_.size() == (unsigned int)feature_descriptors_.rows); 
+  feature_matching_stats_.resize(feature_locations_2d_.size(), 0);
+  ROS_INFO_NAMED("statistics", "Feature Count of Node:\t%d", (int)feature_locations_2d_.size());
+  //computeKeypointDepthStats(depth, feature_locations_2d_);
+
+#ifdef USE_ICP_CODE
+  gicp_initialized = false;
+  gicp_point_set_ = NULL;
+  if(ps->get<int>("emm__skip_step") <= 0 && !ps->get<bool>("store_pointclouds") && ps->get<bool>("use_icp")) 
+  {//if clearing out point clouds, the icp structure needs to be built before
+    gicp_mutex.lock();
+    gicp_point_set_ = this->getGICPStructure();
+    gicp_mutex.unlock();
+  }
+#endif
+  if(ps->get<bool>("use_root_sift") &&
+     (ps->get<std::string>("feature_extractor_type") == "SIFTGPU" ||
+      ps->get<std::string>("feature_extractor_type") == "SURF" ||
+      ps->get<std::string>("feature_extractor_type") == "GFTT" ||
+      ps->get<std::string>("feature_extractor_type") == "SIFT")){
+    squareroot_descriptor_space(feature_descriptors_);
+  }
+}
+
+
+
+
+
+
+
+
+
+
 
 Node::Node(const cv::Mat visual,
            cv::Ptr<cv::FeatureDetector> detector,
@@ -1349,8 +1503,36 @@ MatchingResult Node::matchNodePair(const Node* older_node)
           ROS_INFO("RANSAC found no valid trafo, but had initially %d feature matches with average ratio %f",(int) mr.all_matches.size(), nn_ratio);
 
 #ifdef USE_PCL_ICP
-          if(((int)this->id_ - (int)older_node->id_) <= 1){ //Apply icp only for adjacent frames, as the initial guess needs to be in the global minimum
-            mr.icp_trafo = Eigen::Matrix4f::Identity();
+          if((((int)this->id_ - (int)older_node->id_) <= 1) || true){ //Apply icp only for adjacent frames, as the initial guess needs to be in the global minimum
+
+						//Dapo added
+						
+						Eigen::Quaternion<float> q_older((float)older_node->approx_transform_.transform.rotation.w,(float)older_node->approx_transform_.transform.rotation.x,(float)older_node->approx_transform_.transform.rotation.y,(float)older_node->approx_transform_.transform.rotation.z);
+
+						Eigen::Quaternion<float> q_new((float)this->approx_transform_.transform.rotation.w,(float)this->approx_transform_.transform.rotation.x,(float)this->approx_transform_.transform.rotation.y,(float)this->approx_transform_.transform.rotation.z);
+
+
+						Eigen::Matrix3f rotation_older = q_older.toRotationMatrix();
+						Eigen::Matrix3f rotation_new = q_new.toRotationMatrix();
+
+						//this could crash if no inverse(to do) 
+						Eigen::Matrix4f transform_older;
+						transform_older.block(0,0,2,2) << rotation_older;
+						transform_older.col(3)<< (float)older_node->approx_transform_.transform.translation.x,(float)older_node->approx_transform_.transform.translation.y,(float)older_node->approx_transform_.transform.translation.z,1.0f;
+						transform_older.row(3)<< 0.0f,0.0f,0.0f,1.0f;
+
+						Eigen::Matrix4f transform_new;
+						transform_new.block(0,0,2,2) << rotation_new;
+						transform_new.col(3)<< (float)this->approx_transform_.transform.translation.x,(float)this->approx_transform_.transform.translation.y,(float)this->approx_transform_.transform.translation.z,1.0f;
+						transform_new.row(3)<< 0.0f,0.0f,0.0f,1.0f;
+
+						mr.icp_trafo = transform_older.inverse()*transform_new;
+
+					
+					
+
+						//end of Dapo's addition
+            //mr.icp_trafo = Eigen::Matrix4f::Identity();
             int max_count = ParameterServer::instance()->get<int>("gicp_max_cloud_size");
             pointcloud_type::Ptr tmp1(new pointcloud_type());
             pointcloud_type::Ptr tmp2(new pointcloud_type());

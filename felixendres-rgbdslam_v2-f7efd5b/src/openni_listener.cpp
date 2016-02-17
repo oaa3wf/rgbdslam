@@ -56,6 +56,7 @@ typedef message_filters::Subscriber<sensor_msgs::Image> image_sub_type;
 typedef message_filters::Subscriber<sensor_msgs::CameraInfo> cinfo_sub_type;      
 typedef message_filters::Subscriber<sensor_msgs::PointCloud2> pc_sub_type;      
 typedef message_filters::Subscriber<nav_msgs::Odometry> odom_sub_type;
+typedef message_filters::Subscriber<geometry_msgs::TransformStamped> imu_sub_type;
 
 
 ///Helper for loadBag to circumvent ugly pointer mess if using tflistener 
@@ -114,7 +115,7 @@ void OpenNIListener::visualize_images(cv::Mat visual_image, cv::Mat depth_image)
 OpenNIListener::OpenNIListener(GraphManager* graph_mgr)
 : graph_mgr_(graph_mgr),
   stereo_sync_(NULL), kinect_sync_(NULL), no_cloud_sync_(NULL),
-  visua_sub_(NULL), depth_sub_(NULL), cloud_sub_(NULL),
+  visua_sub_(NULL), depth_sub_(NULL), cloud_sub_(NULL),imu_sub_(NULL),
   depth_mono8_img_(cv::Mat()),
   pause_(ParameterServer::instance()->get<bool>("start_paused")),
   getOneFrame_(false),
@@ -149,6 +150,10 @@ void OpenNIListener::setupSubscribers(){
     std::string widev_tpc = ps->get<std::string>("wide_topic");
     std::string widec_tpc = ps->get<std::string>("wide_cloud_topic");
 
+		//to_do Dapo
+		std::string imu_tpc = "/guidance2/imu";
+
+
     //All information from Kinect
     if(!visua_tpc.empty() && !depth_tpc.empty() && !cloud_tpc.empty())
     {   
@@ -159,8 +164,8 @@ void OpenNIListener::setupSubscribers(){
         kinect_sync_->registerCallback(boost::bind(&OpenNIListener::kinectCallback, this, _1, _2, _3));
         ROS_INFO_STREAM_NAMED("OpenNIListener", "Listening to " << visua_tpc << ", " << depth_tpc << " and " << cloud_tpc);
     } 
-    //No cloud, but visual image and depth
-    else if(!visua_tpc.empty() && !depth_tpc.empty() && !cinfo_tpc.empty() && cloud_tpc.empty())
+    //No cloud, but visual image and depth and no imu
+    else if(!visua_tpc.empty() && !depth_tpc.empty() && !cinfo_tpc.empty() && cloud_tpc.empty() && imu_tpc.empty())
     {   
         visua_sub_ = new image_sub_type(nh, visua_tpc, q);
         depth_sub_ = new image_sub_type(nh, depth_tpc, q);
@@ -168,6 +173,19 @@ void OpenNIListener::setupSubscribers(){
         no_cloud_sync_ = new message_filters::Synchronizer<NoCloudSyncPolicy>(NoCloudSyncPolicy(q),  *visua_sub_, *depth_sub_, *cinfo_sub_);
         no_cloud_sync_->registerCallback(boost::bind(&OpenNIListener::noCloudCallback, this, _1, _2, _3));
         ROS_INFO_STREAM_NAMED("OpenNIListener", "Listening to " << visua_tpc << " and " << depth_tpc);
+    } 
+
+
+ 		//No cloud, but visual image and depth and imu (Dapo created)
+    else if(!visua_tpc.empty() && !depth_tpc.empty() && !cinfo_tpc.empty() && cloud_tpc.empty() && !imu_tpc.empty())
+    {   
+        visua_sub_ = new image_sub_type(nh, visua_tpc, q);
+        depth_sub_ = new image_sub_type(nh, depth_tpc, q);
+        cinfo_sub_ = new cinfo_sub_type(nh, cinfo_tpc, q);
+				imu_sub_ = new imu_sub_type(nh, imu_tpc, q);
+        no_cloud_imu_sync_ = new message_filters::Synchronizer<NoCloudImuSyncPolicy>(NoCloudImuSyncPolicy(q),  *visua_sub_, *depth_sub_, *cinfo_sub_,*imu_sub_);
+        no_cloud_imu_sync_->registerCallback(boost::bind(&OpenNIListener::noCloudCallback, this, _1, _2, _3, _4));
+        ROS_INFO_STREAM_NAMED("OpenNIListener", "Listening to " << visua_tpc << " and " << depth_tpc << " and " << imu_tpc );
     } 
 
     //All information from stereo                                               
@@ -596,6 +614,7 @@ OpenNIListener::~OpenNIListener(){
   delete tflistener_;
 }
 
+
 void OpenNIListener::noCloudCallback (const sensor_msgs::ImageConstPtr& visual_img_msg,
                                       const sensor_msgs::ImageConstPtr& depth_img_msg,
                                       const sensor_msgs::CameraInfoConstPtr& cam_info_msg) 
@@ -669,6 +688,84 @@ void OpenNIListener::noCloudCallback (const sensor_msgs::ImageConstPtr& visual_i
     return;
   }
   noCloudCameraCallback(visual_img, depth_float_img, depth_mono8_img_, visual_img_msg->header, cam_info_msg);
+}
+
+
+//Dapo created for imu
+void OpenNIListener::noCloudCallback (const sensor_msgs::ImageConstPtr& visual_img_msg,
+                                      const sensor_msgs::ImageConstPtr& depth_img_msg,
+                                      const sensor_msgs::CameraInfoConstPtr& cam_info_msg,
+																			const geometry_msgs::TransformStampedConstPtr& approx_transform_msg) 
+{
+  ScopedTimer s(__FUNCTION__);
+  ROS_WARN_ONCE_NAMED("eval", "First RGBD-Data Received");
+  ROS_DEBUG("Received data from kinect");
+  ParameterServer* ps = ParameterServer::instance();
+
+  if(++data_id_ < ps->get<int>("skip_first_n_frames") 
+     || data_id_ % ps->get<int>("data_skip_step") != 0)
+  { 
+  // If only a subset of frames are used, skip computations but visualize if gui is running
+    ROS_INFO_THROTTLE_NAMED(1, "OpenNIListener", "Skipping Frame %i because of data_skip_step setting (this msg is only shown once a sec)", data_id_);
+    if(ps->get<bool>("use_gui")){//Show the image, even if not using it
+      //cv::Mat depth_float_img = cv_bridge::toCvCopy(depth_img_msg)->image;
+      cv::Mat visual_img =  cv_bridge::toCvCopy(visual_img_msg)->image;
+      //if(visual_img.rows != depth_float_img.rows || 
+      //   visual_img.cols != depth_float_img.cols){
+      //  ROS_ERROR("depth and visual image differ in size! Ignoring Data");
+      //  return;
+      //}
+      //depthToCV8UC1(depth_float_img, depth_mono8_img_); //float can't be visualized or used as mask in float format TODO: reprogram keypoint detector to use float values with nan to mask
+      //image_encoding_ = visual_img_msg->encoding;
+      //Q_EMIT newVisualImage(cvMat2QImage(visual_img, 0)); //visual_idx=0
+      //Q_EMIT newDepthImage (cvMat2QImage(depth_mono8_img_,1));//overwrites last cvMat2QImage
+    }
+    return;
+  }
+
+
+  //Convert images to OpenCV format
+  //sensor_msgs::CvBridge bridge;
+  //cv::Mat depth_float_img = bridge.imgMsgToCv(depth_img_msg);
+  //cv::Mat visual_img =  bridge.imgMsgToCv(visual_img_msg);
+  cv::Mat depth_float_img = cv_bridge::toCvCopy(depth_img_msg)->image;
+  //const cv::Mat& depth_float_img_big = cv_bridge::toCvShare(depth_img_msg)->image;
+  cv::Mat visual_img;
+  if(image_encoding_ == "bayer_grbg8"){
+    cv_bridge::toCvShare(visual_img_msg);
+    ROS_INFO_NAMED("OpenNIListener", "Converting from Bayer to RGB");
+    cv::cvtColor(cv_bridge::toCvCopy(visual_img_msg)->image, visual_img, CV_BayerGR2RGB, 3);
+  } else{
+    ROS_DEBUG_STREAM("Encoding: " << visual_img_msg->encoding);
+    visual_img =  cv_bridge::toCvCopy(visual_img_msg)->image;
+  }
+  //const cv::Mat& visual_img_big =  cv_bridge::toCvShare(visual_img_msg)->image;
+  //cv::Size newsize(320, 240);
+  //cv::Mat visual_img(newsize, visual_img_big.type()), depth_float_img(newsize, depth_float_img_big.type());
+  //cv::resize(visual_img_big, visual_img, newsize);
+  //cv::resize(depth_float_img_big, depth_float_img, newsize);
+  if(visual_img.rows != depth_float_img.rows || 
+     visual_img.cols != depth_float_img.cols){
+    ROS_ERROR("depth and visual image differ in size! Ignoring Data");
+    //cv::resize(depth_float_img, depth_float_img, visual_img.size(), 0,0,cv::INTER_NEAREST);
+    return;
+  }
+  image_encoding_ = visual_img_msg->encoding;
+
+  depthToCV8UC1(depth_float_img, depth_mono8_img_); //float can't be visualized or used as mask in float format TODO: reprogram keypoint detector to use float values with nan to mask
+
+  if(asyncFrameDrop(depth_img_msg->header.stamp, visual_img_msg->header.stamp)) 
+    return;
+
+
+  if(pause_ && !getOneFrame_){ 
+    if(ps->get<bool>("use_gui")){
+      Q_EMIT newVisualImage(cvMat2QImage(visual_img, 0)); //visual_idx=0
+      Q_EMIT newDepthImage (cvMat2QImage(depth_mono8_img_,1));//overwrites last cvMat2QImage
+    }
+    return;
+  }
+  noCloudCameraCallback(visual_img, depth_float_img, depth_mono8_img_, visual_img_msg->header, cam_info_msg,approx_transform_msg);
 }
 
 
@@ -759,8 +856,6 @@ void OpenNIListener::cameraCallback(cv::Mat visual_img,
 
 
 
-
-
 void OpenNIListener::noCloudCameraCallback(cv::Mat visual_img, 
                                            cv::Mat depth, 
                                            cv::Mat depth_mono8_img,
@@ -776,6 +871,29 @@ void OpenNIListener::noCloudCameraCallback(cv::Mat visual_img,
   //######### Main Work: create new node ##############################################################
   //Q_EMIT setGUIStatus("Computing Keypoints and Features");
   Node* node_ptr = new Node(visual_img, depth, depth_mono8_img, cam_info, depth_header, detector_, extractor_);
+
+  retrieveTransformations(depth_header, node_ptr);//Retrieve the transform between the lens and the base-link at capturing time;
+  callProcessing(visual_img, node_ptr);
+}
+
+
+//Dapo created for imu
+void OpenNIListener::noCloudCameraCallback(cv::Mat visual_img, 
+                                           cv::Mat depth, 
+                                           cv::Mat depth_mono8_img,
+                                           std_msgs::Header depth_header,
+                                           const sensor_msgs::CameraInfoConstPtr& cam_info,
+																					 const geometry_msgs::TransformStampedConstPtr& approx_transform)
+{
+  if(getOneFrame_) { //if getOneFrame_ is set, unset it and skip check for  pause
+      getOneFrame_ = false;
+  } else if(pause_) { //Visualization and nothing else
+    return; 
+  }
+  ScopedTimer s(__FUNCTION__);
+  //######### Main Work: create new node ##############################################################
+  //Q_EMIT setGUIStatus("Computing Keypoints and Features");
+  Node* node_ptr = new Node(visual_img, depth, depth_mono8_img, cam_info,approx_transform, depth_header, detector_, extractor_);
 
   retrieveTransformations(depth_header, node_ptr);//Retrieve the transform between the lens and the base-link at capturing time;
   callProcessing(visual_img, node_ptr);

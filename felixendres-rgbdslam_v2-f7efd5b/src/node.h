@@ -30,6 +30,7 @@
 //#include <image_geometry/pinhole_camera_model.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <sensor_msgs/CameraInfo.h>
+#include <geometry_msgs/TransformStamped.h>
 /*
 #include <pcl/registration/icp.h>
 #include <pcl/registration/impl/icp.hpp>
@@ -65,6 +66,18 @@ public:
 			 const cv::Mat& depth,
 			 const cv::Mat& detection_mask,
        const sensor_msgs::CameraInfoConstPtr& cam_info, 
+       myHeader depth_header,
+			 cv::Ptr<cv::FeatureDetector> detector,
+			 cv::Ptr<cv::DescriptorExtractor> extractor);
+	///Dapo added this part so we can pass guess transform for icp
+	///Visual must be CV_8UC1, depth CV_32FC1, 
+	///detection_mask must be CV_8UC1 with non-zero 
+	///at potential keypoint locations
+	Node(const cv::Mat& visual,
+			 const cv::Mat& depth,
+			 const cv::Mat& detection_mask,
+       const sensor_msgs::CameraInfoConstPtr& cam_info, 
+			 const geometry_msgs::TransformStampedConstPtr& approx_transform,
        myHeader depth_header,
 			 cv::Ptr<cv::FeatureDetector> detector,
 			 cv::Ptr<cv::DescriptorExtractor> extractor);
@@ -195,6 +208,7 @@ public:
 
   myHeader header_;
   const sensor_msgs::CameraInfo& getCamInfo() const {return cam_info_;}
+	const geometry_msgs::TransformStamped& getApproxTransform() const {return approx_transform_ ;}
 
 protected:
   const cv::flann::Index* getFlannIndex() const;
@@ -205,7 +219,9 @@ protected:
   tf::StampedTransform ground_truth_transform_;//!<contains the transformation from the mocap system
   tf::StampedTransform odom_transform_;        //!<contains the transformation from the wheel encoders/joint states
   int initial_node_matches_;
-  sensor_msgs::CameraInfo cam_info_; 
+  sensor_msgs::CameraInfo cam_info_;
+	geometry_msgs::TransformStamped approx_transform_; //!<contains initial guess for tranformation from imu
+	
   //void computeKeypointDepthStats(const cv::Mat& depth_img, const std::vector<cv::KeyPoint> keypoints);
 
 #ifdef USE_SIFT_GPU
